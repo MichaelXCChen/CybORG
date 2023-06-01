@@ -1,19 +1,16 @@
-from typing import Optional
+from typing import Optional, Tuple
+
+import numpy as np
+from gym import spaces
 
 from CybORG import CybORG
 from CybORG.Agents.Wrappers import BaseWrapper
-import warnings
-from gym import spaces
-import numpy as np
-
-from pettingzoo import ParallelEnv
-from pettingzoo.utils import wrappers
-from CybORG.Agents.Wrappers import BaseWrapper, OpenAIGymWrapper, BlueTableWrapper, RedTableWrapper, EnumActionWrapper
-from CybORG.Shared.CommsRewardCalculator import CommsAvailabilityRewardCalculator
+from CybORG.Simulator.Actions import Sleep
 
 
 class PettingZooParallelWrapper(BaseWrapper):
-    def __init__(self, env: CybORG):
+
+    def __init__(self, env: CybORG,):
         super().__init__(env)
         self._agent_ids = self.possible_agents
         # assuming that the final value in the agent name indicates which drone that agent is on
@@ -27,9 +24,9 @@ class PettingZooParallelWrapper(BaseWrapper):
         self._observation_spaces = {agent_name: spaces.MultiDiscrete(
             [3] + [2 for i in range(num_drones)] + [2] + [3 for i in range(num_drones)] + [101, 101] + (
                     num_drones - 1) * [num_drones, 101, 101, 2]) for agent_name in self.possible_agents}
+        self.msg_len = 0
         self.metadata = {"render_modes": ["human", "rgb_array"], "name": "Cage_Challenge_3"}
-        self.seed = 117
-
+        self.agent_actions = self.int_to_cyborg_action()
         self.dones = {agent: False for agent in self.possible_agents}
         self.rewards = {agent: 0. for agent in self.possible_agents}
         self.infos = {}
@@ -39,27 +36,32 @@ class PettingZooParallelWrapper(BaseWrapper):
               return_info: bool = False,
               options: Optional[dict] = None) -> dict:
         res = self.env.reset()
+        self.agent_actions = self.int_to_cyborg_action()
         self.dones = {agent: False for agent in self.possible_agents}
         self.rewards = {agent: 0. for agent in self.possible_agents}
         self.infos = {}
         # assuming that the final value in the agent name indicates which drone that agent is on
+        self.int_to_action = self.int_to_cyborg_action()
         self.agent_host_map = {agent_name: f'drone_{agent_name.split("_")[-1]}' for agent_name in self.possible_agents}
         self.ip_addresses = list(self.env.get_ip_map().values())
         return {agent: self.observation_change(agent, obs=self.env.get_observation(agent)) for agent in self.agents}
 
-    def step(self, actions: dict) -> (dict, dict, dict, dict):
+    def step(self, actions: dict) -> Tuple[dict, dict, dict, dict]:
         actions, msgs = self.select_messages(actions)
+        actions_dict = {}
+
         for agent, act in actions.items():
             assert self.action_space(agent).contains(act)
+            actions_dict[agent] = self.agent_actions[agent][act]
 
-        raw_obs, rews, dones, infos = self.env.parallel_step(actions, messages=msgs)
+        raw_obs, rews, dones, infos = self.env.parallel_step(actions_dict, messages=msgs)
         # green_agents = {agent: if }
         # rews = GreenAvailabilityRewardCalculator(raw_obs, ['green_agent_0','green_agent_1', 'green_agent_2' ]).calculate_reward()
-        obs = {agent: self.observation_change(agent, raw_obs[agent]) for agent in self.env.active_agents}
+        obs = {agent: self.observation_change(agent, raw_agent_obs) for agent, raw_agent_obs in raw_obs.items()}
         # obs = {agent: self.observation_change(agent, obs) for agent in self.possible_agents}
         # set done to true if maximumum steps are reached
         self.dones.update(dones)
-        self.rewards = {agent: float(sum(rews[agent].values())) for agent in self.env.active_agents}
+        self.rewards = {agent: float(sum(agent_rew.values())) for agent, agent_rew in rews.items()}
         # send messages
         return obs, self.rewards, dones, infos
 
@@ -159,6 +161,37 @@ class PettingZooParallelWrapper(BaseWrapper):
         '''
         return self.dones[agent]
 
+    def int_to_cyborg_action(self):
+        '''
+        Returns a dictionary containing dictionaries that maps the number selected by the agent to a specific CybORG action
+
+        '''
+        cyborg_agent_actions = {}
+        for agent in self.active_agents:
+            cyborg_action_to_int = {}
+            act_count = 0
+            for action in self.env.get_action_space(self.active_agents[0])['action'].keys():
+                params_dict = {}
+                if action.__name__ == 'Sleep':
+                    cyborg_action_to_int[act_count] = Sleep()
+                    act_count+=1
+                elif action.__name__ == 'RemoveOtherSessions':
+                    params_dict['agent'] = agent
+                    params_dict['session'] = 0
+                    cyborg_action_to_int[act_count] = action(**params_dict)
+                    act_count+=1
+                else:
+                    for ip in self.env.get_action_space(self.active_agents[0])['ip_address'].keys():
+                        for sess in self.env.get_action_space(self.active_agents[0])['session'].keys():
+                            if sess == 0:
+                                params_dict['session'] = 0
+                                params_dict['ip_address'] = ip
+                                params_dict['agent'] = agent
+                                cyborg_action_to_int[act_count] = action(**params_dict)
+                                act_count+=1
+            cyborg_agent_actions[agent] = cyborg_action_to_int
+        return cyborg_agent_actions
+    
     def get_action_space(self, agent):
         '''
         Obtains the action_space of the specified agent
@@ -166,13 +199,10 @@ class PettingZooParallelWrapper(BaseWrapper):
         Parameters:
             agent -> str
         '''
-        this_agent = agent
         initial = self.env.get_action_space(agent)
-
+        this_agent = agent
         unmasked_as = []
         agent_actions = []
-        action_list = ['ExploitDroneVulnerability', 'SeizeControl', 'FloodBandwidth', 'BlockTraffic', 'AllowTraffic',
-                       'RetakeControl', 'SendData']
 
         for key in initial.copy():
             if key != 'action':
@@ -182,17 +212,14 @@ class PettingZooParallelWrapper(BaseWrapper):
         for i in range(len(init_list)):
             agent_actions.append(init_list[i][0].__name__)
 
-        if ('Sleep' in agent_actions):
-            unmasked_as.append('Sleep')
-
-        if ('RemoveOtherSessions' in agent_actions):
-            unmasked_as.append(f'Remove {this_agent}')
-
-        for act in action_list:
-            if (act in agent_actions):
-                for agent in self.possible_agents:
+        for act in agent_actions:
+            if act == 'Sleep':
+                unmasked_as.append('Sleep')
+            elif act == 'RemoveOtherSessions':
+                unmasked_as.append(f'RemoveOtherSessions {this_agent}')
+            else:
+                for agent in self.agent_host_map.values():
                     unmasked_as.append(f"{act} {agent}")
-
         return unmasked_as
 
     def observation_change(self, agent: str, obs: dict):
@@ -211,7 +238,7 @@ class PettingZooParallelWrapper(BaseWrapper):
             # get all ip_addresses
             self.ip_addresses = list(self.env.get_ip_map().values())
             num_drones = len(self.ip_addresses)
-            obs_length = int(1 + num_drones + 1 + num_drones + 2 + (num_drones - 1) * (2 + 1 + 1))
+            obs_length = int(1 + num_drones + 1 + num_drones + 2 + (num_drones - 1) * (2 + 1 + 1) + self.msg_len)
             new_obs = np.zeros(obs_length, dtype=np.int)
             if obs is not None:
                 own_host_name = self.agent_host_map[agent]
@@ -219,15 +246,15 @@ class PettingZooParallelWrapper(BaseWrapper):
                 # element location --> [0, 1,...,num_drones, 1+num_drones, 2+num_drones, ..., 2+2*num_drones, 3+2*num_drones, 4+2*num_drones,...,4+4*num_drones]
                 index = 0
                 # success
-                new_obs[index] = obs['success'].value
+                new_obs[index] = obs['success'].value - 1
                 index += 1
 
                 if agent in self.env.active_agents:
                     # Add blocked IPs
                     for i, ip in enumerate(self.ip_addresses):
-                        new_obs[index + i] = 1 if ip in [interface['blocked_ips'] for interface in
+                        new_obs[index + i] = 1 if ip in [blocked_ip for interface in
                                                          obs[own_host_name]['Interface'] if
-                                                         'blocked_ips' in interface] else 0
+                                                         'blocked_ips' in interface for blocked_ip in interface['blocked_ips']] else 0
                     index += len(self.ip_addresses)
 
                     # add flagged malicious processes
@@ -235,10 +262,11 @@ class PettingZooParallelWrapper(BaseWrapper):
                     index += 1
                     # add flagged messages
                     for i, ip in enumerate(self.ip_addresses):
-                        # TODO add in check for network connections
-                        new_obs[i] = 1 if ip in [interface['Network Connections'] for interface in
-                                                 obs[own_host_name]['Interface'] if
-                                                 'Network Connections' in interface] else 0
+                        new_obs[index + i] = 1 if ip in [network_conn['remote_address']
+                                                         for interface in obs[own_host_name]['Interface']
+                                                         if 'NetworkConnections' in interface
+                                                         for network_conn in interface['NetworkConnections']] \
+                            else 0
                     index += len(self.ip_addresses)
 
                     pos = obs[own_host_name]['System info'].get('position', (0, 0))
@@ -259,7 +287,7 @@ class PettingZooParallelWrapper(BaseWrapper):
                                 new_obs[index + 1] = max(int(pos[1]), 0)
                                 index += 2
                                 # add session to drone
-                                new_obs[index] = 1 if 'Session' in obs[hostname] else 0
+                                new_obs[index] = 1 if 'Sessions' in obs[hostname] else 0
                                 index += 1
                             else:
                                 new_obs[index] = 0
@@ -269,7 +297,9 @@ class PettingZooParallelWrapper(BaseWrapper):
 
                     msg = self.parse_message(obs['message'] if 'message' in obs else [], agent)
                     if len(msg) > 0:
-                        new_obs = np.concatenate((new_obs, np.array(msg)))
+                        for j in range(len(msg)):
+                            new_obs[index+j] = msg[j]
+                        index += len(msg)
                 # update data of other drones
                 # try:
                 assert self._observation_spaces[agent].contains(
@@ -291,3 +321,4 @@ class PettingZooParallelWrapper(BaseWrapper):
     @property
     def possible_agents(self):
         return self.env.agents
+

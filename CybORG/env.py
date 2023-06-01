@@ -4,19 +4,18 @@ from typing import Any, Union
 
 import gym
 from gym.utils import seeding
-from matplotlib import pyplot as plt
 
 from CybORG.Shared import Observation, Results, CybORGLogger
+from CybORG.Shared.Enums import DecoyType
+from CybORG.Shared.EnvironmentController import EnvironmentController
+from CybORG.Shared.Scenarios.ScenarioGenerator import ScenarioGenerator
 from CybORG.Simulator.Actions import DiscoverNetworkServices, DiscoverRemoteSystems, ExploitRemoteService, \
     InvalidAction, \
-    Sleep, PrivilegeEscalate, Impact, Remove, Restore, SeizeControl, RetakeControl, RemoveOtherSessions
+    Sleep, PrivilegeEscalate, Impact, Remove, Restore, SeizeControl, RetakeControl, RemoveOtherSessions, FloodBandwidth
 from CybORG.Simulator.Actions.ConcreteActions.ActivateTrojan import ActivateTrojan
 from CybORG.Simulator.Actions.ConcreteActions.ControlTraffic import BlockTraffic, AllowTraffic
 from CybORG.Simulator.Actions.ConcreteActions.ExploitActions.ExploitAction import ExploitAction
-from CybORG.Shared.Enums import DecoyType
-from CybORG.Shared.EnvironmentController import EnvironmentController
 from CybORG.Simulator.Scenarios import DroneSwarmScenarioGenerator
-from CybORG.Shared.Scenarios.ScenarioGenerator import ScenarioGenerator
 from CybORG.Tests.utils import CustomGenerator
 # from CybORG.render.renderer import Renderer
 
@@ -113,15 +112,19 @@ class CybORG(CybORGLogger):
                 tuple
                     the result of agent performing the action
                 """
+        if actions is not None and len(actions)>0:
+            agents = list(actions.keys())
+        else:
+            agents = []
         if actions is self.environment_controller.action:
             warnings.warn("Reuse of the actions input. This variable is altered inside the simulation "
                           "and may contain actions from previous steps")
         self.environment_controller.step(actions, skip_valid_action_check)
         self.environment_controller.send_messages(messages)
-        return {agent: obs.data for agent, obs in self.environment_controller.observation.items()}, \
-               {agent: self.environment_controller.get_reward(agent) for agent
-                in self.active_agents}, \
-               {agent: self.environment_controller.done for agent in self.active_agents}, {}
+        agents = set(agents+self.active_agents)
+        return {agent: self.get_observation(agent) for agent in agents}, \
+               {agent: self.environment_controller.get_reward(agent) for agent in agents}, \
+               {agent: self.environment_controller.done for agent in agents}, {}
 
     def step(self, agent: str = None, action=None, messages: dict = None, skip_valid_action_check: bool = False) -> Results:
         """Performs a step in CybORG for the given agent.
@@ -452,6 +455,8 @@ class CybORG(CybORGLogger):
         red_hosts = []
         red_low_hosts = []
         for agent in self.environment_controller.team['Red']:
+            if not self.environment_controller.is_active(agent):
+                continue
             red_hosts += [i.hostname for i in self.environment_controller.state.sessions[agent].values() if
                           i.username == 'SYSTEM' or i.username == 'root']
             red_low_hosts += [i.hostname for i in self.environment_controller.state.sessions[agent].values()]
@@ -484,14 +489,20 @@ class CybORG(CybORGLogger):
                         red_action_type = 'port scan'
                     elif isinstance(red_action, Impact):
                         red_action_type = 'impact'
+                    elif isinstance(red_action, (AllowTraffic, BlockTraffic, FloodBandwidth)):
+                        red_action_type = None
                     else:
                         red_action_type = type(red_action)
-                    data['actions'].append(
-                        {"agent": red_from, "destination": red_target, "source": red_source, "type": red_action_type})
+
+                    if red_action_type is not None:                    
+                        data['actions'].append(
+                            {"agent": red_from, "destination": red_target, "source": red_source, "type": red_action_type})
 
         blue_hosts = []
         blue_protected_hosts = []
         for agent in self.environment_controller.team['Blue']:
+            if not self.environment_controller.is_active(agent):
+                continue
             blue_hosts += [i.hostname for i in self.environment_controller.state.sessions[agent].values()]
             blue_protected_hosts += [blue_session.hostname for blue_session in
                                     self.environment_controller.state.sessions[agent].values() if
